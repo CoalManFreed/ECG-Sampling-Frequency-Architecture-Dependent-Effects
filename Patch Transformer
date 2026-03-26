@@ -515,9 +515,7 @@ def compute_curve_data(y_true, y_prob):
     }
 
 def train_and_eval_patch_transformer(X, y, label, data_meta):
-    print("\n==============================")
     print(f"Patch-Transformer training on {label}")
-    print("==============================")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=SEED,
@@ -885,7 +883,5 @@ print(f"Saved Figure 2 to: {fig2}")
 print(f"Saved Figure 3 to: {fig3}")
 print(f"Saved Figure 4 to: {fig4}")
 
-print("\n==============================")
 print("MANUSCRIPT RESULTS SECTION")
-print("==============================")
 print(results_text)
