@@ -378,7 +378,7 @@ def compute_all_bootstrap_cis(y_true, y_prob):
         "accuracy": bootstrap_ci(y_true, y_prob, exact_match_acc),
     }
 
-    print("\n--- Bootstrapped 95% CIs ---")
+    print("Bootstrapped 95% CIs")
     for metric, vals in ci_results.items():
         print(
             f"{metric}: {vals['point_estimate']:.4f} "
@@ -425,9 +425,7 @@ def compute_per_class_bootstrap_cis(y_true, y_prob, threshold=0.5):
 
 
 def train_and_profile(X, y, label, data_meta):
-    print("\n==============================")
     print(f"Training on {label}")
-    print("==============================")
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=SEED,
@@ -817,9 +815,7 @@ def main():
     print(f"Saved Figure 3 to: {fig3}")
     print(f"Saved Figure 4 to: {fig4}")
 
-    print("\n==============================")
     print("MANUSCRIPT RESULTS SECTION")
-    print("==============================")
     print(results_text)
 
 
