@@ -1,0 +1,891 @@
+try:
+    import wfdb  # noqa
+except Exception:
+    import sys, subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "wfdb"])
+
+import os
+import ast
+import json
+import time
+import random
+import psutil
+from dataclasses import dataclass, asdict
+
+import numpy as np
+import pandas as pd
+import wfdb
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import kagglehub
+
+from tensorflow.keras import layers, models, optimizers
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_fscore_support,
+    roc_curve,
+    precision_recall_curve,
+)
+
+
+SEED = 20
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+DATASET_SLUG = "colefreedman/coleptbwith300hz"
+TARGET_SUPER = ["NORM", "MI", "STTC", "CD", "HYP"]
+
+MAX_SAMPLES = 15000
+EPOCHS = 100
+
+BATCH_SIZE_100 = 64
+BATCH_SIZE_300 = 64
+BATCH_SIZE_500 = 64
+
+D_MODEL = 96
+NUM_HEADS = 4
+FF_DIM = 192
+NUM_BLOCKS = 2
+DROPOUT = 0.1
+
+PATCH_SIZE_100 = 8
+PATCH_SIZE_300 = 24
+PATCH_SIZE_500 = 40
+
+OUT_JSON = "cost_results_transformer.json"
+OUT_RESULTS_MD = "results_section_transformer.md"
+FIG_DIR = "figures_transformer"
+
+INF_BATCH_SIZES = [1, 16, 64, 256]
+INF_N_BATCHES = 20
+INF_WARMUP_BATCHES = 5
+GPU_INDEX = 0
+
+N_BOOTSTRAP = 1000   # number of resamples — 1000 is standard for publication
+CI_ALPHA = 0.95      # 95% confidence interval
+BOOTSTRAP_SEED = 42  # separate seed so CIs are reproducible independently of training
+
+os.makedirs(FIG_DIR, exist_ok=True)
+
+
+def bytes_to_mb(x: float) -> float:
+    return float(x) / (1024.0 * 1024.0)
+
+def get_process_rss_mb() -> float:
+    proc = psutil.Process(os.getpid())
+    return bytes_to_mb(proc.memory_info().rss)
+
+def get_gpu_mem_mb(gpu_index: int = 0):
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if not gpus or gpu_index >= len(gpus):
+            return None
+        dev = f"GPU:{gpu_index}"
+        info = tf.config.experimental.get_memory_info(dev)
+        return {
+            "current_mb": bytes_to_mb(info.get("current", 0)),
+            "peak_mb": bytes_to_mb(info.get("peak", 0)),
+        }
+    except Exception:
+        return None
+
+def estimate_model_checkpoint_mb(model: tf.keras.Model) -> float:
+    return (model.count_params() * 4) / (1024.0 * 1024.0)
+
+class EpochTimer(tf.keras.callbacks.Callback):
+    def __init__(self):
+        super().__init__()
+        self.epoch_times = []
+        self._t0 = None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._t0 = time.perf_counter()
+
+    def on_epoch_end(self, epoch, logs=None):
+        if self._t0 is None:
+            return
+        self.epoch_times.append(time.perf_counter() - self._t0)
+        self._t0 = None
+
+@dataclass
+class InferenceStats:
+    batch_size: int
+    n_samples: int
+    wall_s: float
+    ms_per_sample: float
+    samples_per_s: float
+    rss_mb_before: float
+    rss_mb_after: float
+    gpu_mem_before: dict
+    gpu_mem_after: dict
+
+def find_first(root, filename):
+    for r, ds, fs in os.walk(root):
+        for f in fs:
+            if f == filename:
+                return os.path.join(r, f)
+    return None
+
+def maybe_bump_up_for_records(dataset_dir):
+    needed = ("records100", "records300", "records500")
+    if any(os.path.exists(os.path.join(dataset_dir, x)) for x in needed):
+        return dataset_dir
+    parent = os.path.dirname(dataset_dir)
+    if any(os.path.exists(os.path.join(parent, x)) for x in needed):
+        return parent
+    return dataset_dir
+
+def ensure_dict(x):
+    return ast.literal_eval(x) if isinstance(x, str) else x
+
+def label_short(label: str) -> str:
+    if "100" in label:
+        return "100 Hz"
+    if "300" in label:
+        return "300 Hz"
+    if "500" in label:
+        return "500 Hz"
+    return label
+
+def make_markdown_table(df: pd.DataFrame, float_cols=None, digits: int = 3) -> str:
+    df_fmt = df.copy()
+    if float_cols is None:
+        float_cols = list(df_fmt.select_dtypes(include=[np.number]).columns)
+    for col in float_cols:
+        if col in df_fmt.columns:
+            df_fmt[col] = df_fmt[col].map(lambda x: f"{x:.{digits}f}" if pd.notnull(x) else "")
+    return df_fmt.to_markdown(index=False)
+
+def bootstrap_ci(y_true, y_prob, metric_fn, n_bootstrap=N_BOOTSTRAP,
+                 ci_alpha=CI_ALPHA, seed=BOOTSTRAP_SEED):
+
+    rng = np.random.default_rng(seed)
+    n = len(y_true)
+    scores = []
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)          # sample with replacement
+        try:
+            score = metric_fn(y_true[idx], y_prob[idx])
+            scores.append(score)
+        except ValueError:
+            # can happen if a resample lacks a class — skip silently
+            continue
+
+    scores = np.array(scores)
+    lower_p = (1.0 - ci_alpha) / 2.0 * 100
+    upper_p = (1.0 - (1.0 - ci_alpha) / 2.0) * 100
+
+    return {
+        "point_estimate": float(metric_fn(y_true, y_prob)),
+        "ci_lower": float(np.percentile(scores, lower_p)),
+        "ci_upper": float(np.percentile(scores, upper_p)),
+        "ci_alpha": ci_alpha,
+        "n_bootstrap": len(scores),
+    }
+
+
+def compute_all_bootstrap_cis(y_true, y_prob):
+
+    print(f"\nComputing bootstrapped CIs ({N_BOOTSTRAP} resamples) ...")
+
+    def roc_macro(yt, yp):
+        return roc_auc_score(yt, yp, average="macro")
+
+    def roc_micro(yt, yp):
+        return roc_auc_score(yt, yp, average="micro")
+
+    def pr_macro(yt, yp):
+        return average_precision_score(yt, yp, average="macro")
+
+    def pr_micro(yt, yp):
+        return average_precision_score(yt, yp, average="micro")
+
+    def exact_match_acc(yt, yp):
+        y_pred = (yp >= 0.5).astype(int)
+        return float(np.mean(np.all(y_pred == yt.astype(int), axis=1)))
+
+    ci_results = {
+        "roc_auc_macro": bootstrap_ci(y_true, y_prob, roc_macro),
+        "roc_auc_micro": bootstrap_ci(y_true, y_prob, roc_micro),
+        "pr_auc_macro":  bootstrap_ci(y_true, y_prob, pr_macro),
+        "pr_auc_micro":  bootstrap_ci(y_true, y_prob, pr_micro),
+        "accuracy":      bootstrap_ci(y_true, y_prob, exact_match_acc),
+    }
+
+    print("\n--- Bootstrapped 95% CIs ---")
+    for metric, vals in ci_results.items():
+        print(
+            f"  {metric:<20s}: {vals['point_estimate']:.4f} "
+            f"(95% CI {vals['ci_lower']:.4f} - {vals['ci_upper']:.4f})"
+            f"  [n={vals['n_bootstrap']}]"
+        )
+
+    return ci_results
+
+
+def compute_per_class_bootstrap_cis(y_true, y_prob):
+
+    print("\nComputing per-class bootstrapped CIs ...")
+
+    per_class = []
+    for i, cls in enumerate(TARGET_SUPER):
+        def roc_cls(yt, yp, idx=i):
+            if len(np.unique(yt[:, idx])) < 2:
+                raise ValueError("Only one class present")
+            return roc_auc_score(yt[:, idx], yp[:, idx])
+
+        def f1_cls(yt, yp, idx=i):
+            y_pred = (yp[:, idx] >= 0.5).astype(int)
+            _, _, f1, _ = precision_recall_fscore_support(
+                yt[:, idx], y_pred, average="binary", zero_division=0
+            )
+            return float(f1)
+
+        # Use offset seeds per class so resamples are independent across classes
+        roc_ci = bootstrap_ci(y_true, y_prob, roc_cls, seed=BOOTSTRAP_SEED + i)
+        f1_ci  = bootstrap_ci(y_true, y_prob, f1_cls,  seed=BOOTSTRAP_SEED + 10 + i)
+
+        per_class.append({
+            "Class": cls,
+            "ROC-AUC": roc_ci["point_estimate"],
+            "ROC-AUC CI Lower": roc_ci["ci_lower"],
+            "ROC-AUC CI Upper": roc_ci["ci_upper"],
+            "F1": f1_ci["point_estimate"],
+            "F1 CI Lower": f1_ci["ci_lower"],
+            "F1 CI Upper": f1_ci["ci_upper"],
+        })
+
+        print(
+            f"  {cls}: ROC-AUC {roc_ci['point_estimate']:.4f} "
+            f"(95% CI {roc_ci['ci_lower']:.4f}-{roc_ci['ci_upper']:.4f}) | "
+            f"F1 {f1_ci['point_estimate']:.4f} "
+            f"(95% CI {f1_ci['ci_lower']:.4f}-{f1_ci['ci_upper']:.4f})"
+        )
+
+    return per_class
+
+
+data_root = kagglehub.dataset_download(DATASET_SLUG)
+print("Downloaded dataset root:", data_root)
+
+META_CSV = find_first(data_root, "ptbxl_database.csv")
+SCP_CSV  = find_first(data_root, "scp_statements.csv")
+if META_CSV is None or SCP_CSV is None:
+    raise FileNotFoundError("Could not find ptbxl_database.csv and/or scp_statements.csv in the dataset.")
+
+DATASET_DIR = maybe_bump_up_for_records(os.path.dirname(META_CSV))
+print("Dataset dir:", DATASET_DIR)
+print("Has records100:", os.path.exists(os.path.join(DATASET_DIR, "records100")))
+print("Has records300:", os.path.exists(os.path.join(DATASET_DIR, "records300")))
+print("Has records500:", os.path.exists(os.path.join(DATASET_DIR, "records500")))
+
+df  = pd.read_csv(META_CSV)
+scp = pd.read_csv(SCP_CSV)
+
+df["scp_codes_dict"] = df["scp_codes"].apply(ensure_dict)
+
+all_keys = set()
+for d in df["scp_codes_dict"].head(5000):
+    all_keys.update(d.keys())
+
+best_col, best_overlap = None, -1
+for c in scp.columns:
+    if scp[c].dtype == object:
+        overlap = len(set(scp[c].astype(str)) & all_keys)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_col = c
+print("SCP column detected:", best_col)
+
+sub = scp[scp["diagnostic"] == 1][[best_col, "diagnostic_class"]].dropna()
+scp_to_super = {str(code): str(dclass) for code, dclass in sub.itertuples(index=False)}
+
+def derive_superclasses(d):
+    return {scp_to_super[c] for c in d if c in scp_to_super}
+
+df["superclasses"] = df["scp_codes_dict"].apply(derive_superclasses)
+
+for s in TARGET_SUPER:
+    df[s] = df["superclasses"].apply(lambda ss: 1 if s in ss else 0)
+
+df = df[df[TARGET_SUPER].sum(axis=1) > 0].reset_index(drop=True)
+print("Total usable ECGs:", len(df))
+print("Filename columns:", [c for c in df.columns if "filename" in c.lower()])
+
+dataset_class_counts = df[TARGET_SUPER].sum(axis=0)
+
+def load_dataset(filename_col, folder_override=None):
+    if filename_col not in df.columns:
+        raise KeyError(
+            f"Missing column '{filename_col}'. Found: {[c for c in df.columns if 'filename' in c.lower()]}"
+        )
+
+    df_use = df.sample(n=min(MAX_SAMPLES, len(df)), random_state=SEED)
+
+    X_list, y_list = [], []
+    skipped = 0
+
+    for _, row in df_use.iterrows():
+        rel = row[filename_col]
+        if not isinstance(rel, str) or rel.strip() == "":
+            skipped += 1
+            continue
+
+        if folder_override is not None:
+            rel = rel.replace("records500", folder_override)
+
+        base = os.path.join(DATASET_DIR, rel)
+        if not os.path.exists(base + ".hea"):
+            skipped += 1
+            continue
+
+        sig, _ = wfdb.rdsamp(base)
+        X_list.append(sig.astype(np.float32))
+        y_list.append(row[TARGET_SUPER].values.astype(np.float32))
+
+    if len(X_list) == 0:
+        raise RuntimeError(
+            f"Loaded 0 records for {filename_col} (override={folder_override}). "
+            f"Check DATASET_DIR={DATASET_DIR} and folder existence."
+        )
+
+    lengths = [x.shape[0] for x in X_list]
+    L = int(np.median(lengths))
+    C = X_list[0].shape[1]
+
+    def pad_or_crop(x):
+        if x.shape[0] > L:
+            start = (x.shape[0] - L)//2
+            return x[start:start+L]
+        return np.pad(x, ((0, L-x.shape[0]), (0,0)))
+
+    X = np.stack([pad_or_crop(x) for x in X_list])
+    y = np.stack(y_list)
+
+    X = (X - X.mean(axis=1, keepdims=True)) / (X.std(axis=1, keepdims=True) + 1e-6)
+
+    meta = {
+        "n_loaded": int(len(X)),
+        "n_skipped": int(skipped),
+        "L": int(L),
+        "C": int(C),
+        "filename_col": filename_col,
+        "folder_override": folder_override,
+    }
+
+    print(f"Loaded {len(X)} | skipped {skipped} | L={L} | C={C} | col={filename_col} | override={folder_override}")
+    return X, y, meta
+
+
+def pick_patch_and_batch(seq_len):
+    if seq_len <= 1500:
+        return PATCH_SIZE_100, BATCH_SIZE_100
+    elif seq_len <= 3800:
+        return PATCH_SIZE_300, BATCH_SIZE_300
+    else:
+        return PATCH_SIZE_500, BATCH_SIZE_500
+
+class TransformerBlock(layers.Layer):
+    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1, **kwargs):
+        super().__init__(**kwargs)
+        key_dim = max(1, d_model // num_heads)
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=key_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dense(d_model),
+        ])
+        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.drop1 = layers.Dropout(dropout)
+        self.drop2 = layers.Dropout(dropout)
+
+    def call(self, x, training=False):
+        attn = self.att(x, x, training=training)
+        attn = self.drop1(attn, training=training)
+        x = self.norm1(x + attn)
+        ffn = self.ffn(x, training=training)
+        ffn = self.drop2(ffn, training=training)
+        return self.norm2(x + ffn)
+
+class LearnablePositionEmbedding(layers.Layer):
+    def __init__(self, max_len, d_model, **kwargs):
+        super().__init__(**kwargs)
+        self.emb = layers.Embedding(input_dim=max_len, output_dim=d_model)
+
+    def call(self, x):
+        T = tf.shape(x)[1]
+        pos = tf.range(0, T)
+        return x + self.emb(pos)
+
+def make_patch_transformer(seq_len, n_channels, n_classes, patch_size):
+    inp = layers.Input(shape=(seq_len, n_channels))
+
+    x = layers.Conv1D(
+        filters=D_MODEL,
+        kernel_size=patch_size,
+        strides=patch_size,
+        padding="valid"
+    )(inp)
+
+    max_tokens = int(np.ceil(seq_len / patch_size)) + 4
+    x = LearnablePositionEmbedding(max_len=max_tokens, d_model=D_MODEL)(x)
+    x = layers.Dropout(DROPOUT)(x)
+
+    for _ in range(NUM_BLOCKS):
+        x = TransformerBlock(d_model=D_MODEL, num_heads=NUM_HEADS, ff_dim=FF_DIM, dropout=DROPOUT)(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dropout(DROPOUT)(x)
+    out = layers.Dense(n_classes, activation="sigmoid")(x)
+
+    return models.Model(inp, out)
+
+def measure_inference(model, X):
+    out = []
+    for bs in INF_BATCH_SIZES:
+        n_total = min(len(X), bs * INF_N_BATCHES)
+        Xb = X[:n_total]
+
+        for _ in range(INF_WARMUP_BATCHES):
+            _ = model.predict(Xb[: min(bs, n_total)], batch_size=bs, verbose=0)
+
+        rss_before = get_process_rss_mb()
+        gpu_before = get_gpu_mem_mb(GPU_INDEX)
+
+        t0 = time.perf_counter()
+        _ = model.predict(Xb, batch_size=bs, verbose=0)
+        wall = time.perf_counter() - t0
+
+        rss_after = get_process_rss_mb()
+        gpu_after = get_gpu_mem_mb(GPU_INDEX)
+
+        ms_per_sample = (wall * 1000.0) / max(1, n_total)
+        samples_per_s = n_total / max(1e-9, wall)
+
+        out.append(InferenceStats(
+            batch_size=int(bs),
+            n_samples=int(n_total),
+            wall_s=float(wall),
+            ms_per_sample=float(ms_per_sample),
+            samples_per_s=float(samples_per_s),
+            rss_mb_before=float(rss_before),
+            rss_mb_after=float(rss_after),
+            gpu_mem_before=gpu_before,
+            gpu_mem_after=gpu_after,
+        ))
+    return out
+
+def compute_per_class_metrics(y_true, y_prob, threshold=0.5):
+    y_pred = (y_prob >= threshold).astype(int)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0
+    )
+
+    rows = []
+    for i, cls in enumerate(TARGET_SUPER):
+        rows.append({
+            "Class": cls,
+            "Precision": float(precision[i]),
+            "Recall": float(recall[i]),
+            "F1": float(f1[i]),
+            "Support": int(support[i]),
+        })
+    return rows
+
+def compute_curve_data(y_true, y_prob):
+    y_true_flat = y_true.ravel()
+    y_prob_flat = y_prob.ravel()
+
+    fpr, tpr, _ = roc_curve(y_true_flat, y_prob_flat)
+    prec, rec, _ = precision_recall_curve(y_true_flat, y_prob_flat)
+
+    return {
+        "roc_curve": {
+            "fpr": fpr.tolist(),
+            "tpr": tpr.tolist(),
+        },
+        "pr_curve": {
+            "precision": prec.tolist(),
+            "recall": rec.tolist(),
+        }
+    }
+
+def train_and_eval_patch_transformer(X, y, label, data_meta):
+    print("\n==============================")
+    print(f"Patch-Transformer training on {label}")
+    print("==============================")
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=SEED,
+        stratify=np.argmax(y, axis=1)
+    )
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, random_state=SEED,
+        stratify=np.argmax(y_train, axis=1)
+    )
+
+    seq_len = X.shape[1]
+    patch_size, bs = pick_patch_and_batch(seq_len)
+    approx_tokens = int(np.ceil(seq_len / patch_size))
+
+    print(f"seq_len={seq_len} | patch_size={patch_size} | tokens~{approx_tokens} | batch_size={bs}")
+
+    model = make_patch_transformer(
+        seq_len=seq_len,
+        n_channels=X.shape[2],
+        n_classes=len(TARGET_SUPER),
+        patch_size=patch_size
+    )
+
+    model.compile(
+        optimizer=optimizers.Adam(1e-3),
+        loss="binary_crossentropy",
+        metrics=[tf.keras.metrics.AUC(curve="ROC", multi_label=True, name="auc_roc")]
+    )
+
+    timer = EpochTimer()
+    rss_before = get_process_rss_mb()
+    gpu_before = get_gpu_mem_mb(GPU_INDEX)
+
+    t0 = time.perf_counter()
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=bs,
+        verbose=1,
+        callbacks=[timer]
+    )
+    train_wall = time.perf_counter() - t0
+
+    rss_after = get_process_rss_mb()
+    gpu_after = get_gpu_mem_mb(GPU_INDEX)
+
+    y_prob = model.predict(X_test, batch_size=bs, verbose=0)
+    y_pred = (y_prob >= 0.5).astype(int)
+
+    subset_accuracy = float(np.mean(np.all(y_pred == y_test.astype(int), axis=1)))
+
+    metrics = {
+        "roc_auc_micro": float(roc_auc_score(y_test, y_prob, average="micro")),
+        "roc_auc_macro": float(roc_auc_score(y_test, y_prob, average="macro")),
+        "pr_auc_micro": float(average_precision_score(y_test, y_prob, average="micro")),
+        "pr_auc_macro": float(average_precision_score(y_test, y_prob, average="macro")),
+        "accuracy": subset_accuracy,
+    }
+
+    # ---------------------------------------------------------
+    # BOOTSTRAPPED CONFIDENCE INTERVALS
+    # Computed on the same held-out test set as point estimates.
+    # bootstrap_cis  -> overall metrics (ROC-AUC, PR-AUC, accuracy)
+    # per_class_cis  -> per-class ROC-AUC and F1
+    # ---------------------------------------------------------
+    bootstrap_cis = compute_all_bootstrap_cis(y_test, y_prob)
+    per_class_cis = compute_per_class_bootstrap_cis(y_test, y_prob)
+    # ---------------------------------------------------------
+
+    per_class_metrics = compute_per_class_metrics(y_test, y_prob, threshold=0.5)
+    curve_data = compute_curve_data(y_test, y_prob)
+    inference_stats = measure_inference(model, X_test)
+
+    epoch_times = timer.epoch_times
+    epoch_mean = float(np.mean(epoch_times)) if epoch_times else float("nan")
+    epoch_median = float(np.median(epoch_times)) if epoch_times else float("nan")
+
+    profile = {
+        "label": label,
+        "model_type": "Patch Transformer",
+        "n_train": int(len(X_train)),
+        "n_val": int(len(X_val)),
+        "n_test": int(len(X_test)),
+        "epochs": int(EPOCHS),
+        "batch_size": int(bs),
+        "seq_len": int(seq_len),
+        "patch_size": int(patch_size),
+        "approx_tokens": int(approx_tokens),
+        "train_wall_s": float(train_wall),
+        "epoch_times_s": [float(x) for x in epoch_times],
+        "epoch_time_mean_s": epoch_mean,
+        "epoch_time_median_s": epoch_median,
+        "rss_mb_before": float(rss_before),
+        "rss_mb_after": float(rss_after),
+        "gpu_mem_before": gpu_before,
+        "gpu_mem_after": gpu_after,
+        "n_params": int(model.count_params()),
+        "est_checkpoint_mb": float(estimate_model_checkpoint_mb(model)),
+        "metrics": metrics,
+        "bootstrap_cis": bootstrap_cis,        # <-- NEW
+        "per_class_cis": per_class_cis,        # <-- NEW
+        "per_class_metrics": per_class_metrics,
+        "curve_data": curve_data,
+        "inference": [asdict(x) for x in inference_stats],
+        "data_meta": data_meta,
+    }
+
+    print("\nROC-AUC")
+    print("Micro:", metrics["roc_auc_micro"])
+    print("Macro:", metrics["roc_auc_macro"])
+
+    print("\nPR-AUC")
+    print("Micro:", metrics["pr_auc_micro"])
+    print("Macro:", metrics["pr_auc_macro"])
+
+    print("\nAccuracy")
+    print("Exact-match multilabel accuracy:", metrics["accuracy"])
+
+    return model, profile
+
+
+def save_pipeline_placeholder():
+    out = os.path.join(FIG_DIR, "figure1_pipeline_diagram.txt")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(
+            "Pipeline: PTB-XL dataset -> downsampling (100/300/500 Hz) -> patchification -> patch transformer -> evaluation\n"
+        )
+    return out
+
+def save_roc_plot(results):
+    plt.figure(figsize=(7, 5))
+    for prof in results["profiles"]:
+        freq = label_short(prof["label"])
+        fpr = prof["curve_data"]["roc_curve"]["fpr"]
+        tpr = prof["curve_data"]["roc_curve"]["tpr"]
+        auc_val = prof["metrics"]["roc_auc_micro"]
+        ci = prof["bootstrap_cis"]["roc_auc_micro"]
+        plt.plot(
+            fpr, tpr,
+            label=f"{freq} (AUC={auc_val:.3f}, 95% CI {ci['ci_lower']:.3f}-{ci['ci_upper']:.3f})"
+        )
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves by Sampling Frequency")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    out = os.path.join(FIG_DIR, "figure2_roc_curves.png")
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    return out
+
+def save_pr_plot(results):
+    plt.figure(figsize=(7, 5))
+    for prof in results["profiles"]:
+        freq = label_short(prof["label"])
+        rec = prof["curve_data"]["pr_curve"]["recall"]
+        prec = prof["curve_data"]["pr_curve"]["precision"]
+        ap_val = prof["metrics"]["pr_auc_micro"]
+        ci = prof["bootstrap_cis"]["pr_auc_micro"]
+        plt.plot(
+            rec, prec,
+            label=f"{freq} (AP={ap_val:.3f}, 95% CI {ci['ci_lower']:.3f}-{ci['ci_upper']:.3f})"
+        )
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curves by Sampling Frequency")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    out = os.path.join(FIG_DIR, "figure3_pr_curves.png")
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    return out
+
+def save_training_time_plot(results):
+    freqs = [label_short(p["label"]) for p in results["profiles"]]
+    train_times = [p["train_wall_s"] for p in results["profiles"]]
+
+    plt.figure(figsize=(7, 5))
+    plt.plot(freqs, train_times, marker="o")
+    plt.xlabel("Sampling Frequency")
+    plt.ylabel("Training Time (s)")
+    plt.title("Training Time vs Sampling Frequency")
+    plt.tight_layout()
+    out = os.path.join(FIG_DIR, "figure4_training_time_vs_frequency.png")
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    return out
+
+
+def build_results_section(results, dataset_class_counts):
+    lines = []
+    lines.append("## 5. Results\n")
+    lines.append(
+        "This section summarizes dataset composition, Patch Transformer performance across sampling "
+        "frequencies, class-specific classification performance, and computational cost. "
+        "All performance metrics include 95% bootstrapped confidence intervals (1,000 resamples). "
+        "Tables 1-4 and Figures 1-4 present the primary results.\n"
+    )
+
+    # 5.1
+    lines.append("### 5.1 Dataset Characteristics\n")
+    class_df = pd.DataFrame({
+        "Class": TARGET_SUPER,
+        "Count": [int(dataset_class_counts.get(c, 0)) for c in TARGET_SUPER]
+    })
+    lines.append(make_markdown_table(class_df, float_cols=[]))
+    lines.append("\n")
+
+    # 5.2 — performance table with CIs
+    lines.append("### 5.2 Model Performance by Sampling Frequency\n")
+    lines.append(
+        "Table 2 compares overall Patch Transformer performance across the three sampling frequencies. "
+        "Values are point estimates with 95% bootstrapped CIs in parentheses. "
+        "Non-overlapping CIs indicate statistically meaningful differences between conditions.\n"
+    )
+    perf_rows = []
+    for prof in results["profiles"]:
+        ci_roc = prof["bootstrap_cis"]["roc_auc_macro"]
+        ci_pr  = prof["bootstrap_cis"]["pr_auc_macro"]
+        ci_acc = prof["bootstrap_cis"]["accuracy"]
+        perf_rows.append({
+            "Frequency": label_short(prof["label"]),
+            "ROC-AUC (95% CI)":  (
+                f"{ci_roc['point_estimate']:.3f} "
+                f"({ci_roc['ci_lower']:.3f}-{ci_roc['ci_upper']:.3f})"
+            ),
+            "PR-AUC (95% CI)": (
+                f"{ci_pr['point_estimate']:.3f} "
+                f"({ci_pr['ci_lower']:.3f}-{ci_pr['ci_upper']:.3f})"
+            ),
+            "Accuracy (95% CI)": (
+                f"{ci_acc['point_estimate']:.3f} "
+                f"({ci_acc['ci_lower']:.3f}-{ci_acc['ci_upper']:.3f})"
+            ),
+        })
+    perf_df = pd.DataFrame(perf_rows)
+    lines.append(make_markdown_table(perf_df, float_cols=[]))
+    lines.append("\n")
+
+    # 5.3 — per-class with CIs
+    lines.append("### 5.3 Per-Class Performance\n")
+    lines.append(
+        "Table 3 shows class-specific ROC-AUC and F1 scores with 95% bootstrapped CIs "
+        "for each sampling frequency.\n"
+    )
+    for prof in results["profiles"]:
+        freq = label_short(prof["label"])
+        lines.append(f"**{freq}**\n")
+        ci_rows = []
+        for row in prof["per_class_cis"]:
+            ci_rows.append({
+                "Class": row["Class"],
+                "ROC-AUC (95% CI)": (
+                    f"{row['ROC-AUC']:.3f} "
+                    f"({row['ROC-AUC CI Lower']:.3f}-{row['ROC-AUC CI Upper']:.3f})"
+                ),
+                "F1 (95% CI)": (
+                    f"{row['F1']:.3f} "
+                    f"({row['F1 CI Lower']:.3f}-{row['F1 CI Upper']:.3f})"
+                ),
+            })
+        lines.append(make_markdown_table(pd.DataFrame(ci_rows), float_cols=[]))
+        lines.append("\n")
+
+    # 5.4
+    lines.append("### 5.4 Computational Cost\n")
+    cost_rows = []
+    for prof in results["profiles"]:
+        inf64 = next((x for x in prof["inference"] if x["batch_size"] == 64), prof["inference"][0])
+        gpu_peak = prof["gpu_mem_after"].get("peak_mb", None) if prof["gpu_mem_after"] else None
+        cost_rows.append({
+            "Frequency": label_short(prof["label"]),
+            "Training Time (s)": prof["train_wall_s"],
+            "RAM (MB)": prof["rss_mb_after"],
+            "Inference (ms/sample)": inf64["ms_per_sample"],
+            "GPU Peak (MB)": gpu_peak if gpu_peak is not None else np.nan,
+        })
+    cost_df = pd.DataFrame(cost_rows)
+    lines.append(make_markdown_table(cost_df, digits=2))
+    lines.append("\n")
+
+    # 5.5
+    lines.append("### 5.5 Figures\n")
+    lines.append(
+        "Figure 2 shows ROC curves with bootstrapped CI values in the legend. "
+        "Figure 3 shows precision-recall curves with CIs. "
+        "Figure 4 compares training time across frequencies.\n"
+    )
+
+    return "\n".join(lines)
+
+results = {
+    "run_info": {
+        "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tf_version": tf.__version__,
+        "has_gpu": bool(tf.config.list_physical_devices("GPU")),
+        "gpus": [d.name for d in tf.config.list_physical_devices("GPU")],
+        "seed": SEED,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "n_bootstrap": N_BOOTSTRAP,
+        "ci_alpha": CI_ALPHA,
+        "max_samples": MAX_SAMPLES,
+        "epochs": EPOCHS,
+        "dataset_slug": DATASET_SLUG,
+        "dataset_root": data_root,
+        "dataset_dir": DATASET_DIR,
+        "model_type": "Patch Transformer",
+        "d_model": D_MODEL,
+        "num_heads": NUM_HEADS,
+        "ff_dim": FF_DIM,
+        "num_blocks": NUM_BLOCKS,
+        "dropout": DROPOUT,
+        "patch_sizes": {
+            "100_hz": PATCH_SIZE_100,
+            "300_hz": PATCH_SIZE_300,
+            "500_hz": PATCH_SIZE_500,
+        },
+        "dataset_class_counts": {k: int(v) for k, v in dataset_class_counts.to_dict().items()},
+    },
+    "profiles": []
+}
+
+COL_100 = "filename_lr"
+COL_HR  = "filename_hr"
+
+print("\nLoading 100 Hz...")
+X100, y100, meta100 = load_dataset(COL_100)
+
+print("\nLoading 300 Hz...")
+X300, y300, meta300 = load_dataset(COL_HR, folder_override="records300")
+
+print("\nLoading 500 Hz...")
+X500, y500, meta500 = load_dataset(COL_HR)
+
+tmodel100, prof100 = train_and_eval_patch_transformer(X100, y100, "100 Hz (records100)", meta100)
+results["profiles"].append(prof100)
+
+tmodel300, prof300 = train_and_eval_patch_transformer(X300, y300, "300 Hz (records300)", meta300)
+results["profiles"].append(prof300)
+
+tmodel500, prof500 = train_and_eval_patch_transformer(X500, y500, "500 Hz (records500)", meta500)
+results["profiles"].append(prof500)
+
+# Save JSON
+with open(OUT_JSON, "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2)
+print(f"\nSaved detailed results to: {OUT_JSON}")
+
+# Save figures
+fig1 = save_pipeline_placeholder()
+fig2 = save_roc_plot(results)
+fig3 = save_pr_plot(results)
+fig4 = save_training_time_plot(results)
+
+# Save manuscript-style results section
+results_text = build_results_section(results, dataset_class_counts)
+with open(OUT_RESULTS_MD, "w", encoding="utf-8") as f:
+    f.write(results_text)
+
+print(f"\nSaved manuscript-ready results section to: {OUT_RESULTS_MD}")
+print(f"Saved Figure 2 to: {fig2}")
+print(f"Saved Figure 3 to: {fig3}")
+print(f"Saved Figure 4 to: {fig4}")
+
+print("\n==============================")
+print("MANUSCRIPT RESULTS SECTION")
+print("==============================")
+print(results_text)
